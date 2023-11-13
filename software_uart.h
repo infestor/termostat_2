@@ -39,23 +39,21 @@ This is adapted from : NewSoftSerial, SoftwareSerial and SoftwareSerialWithHalfD
 #include <avr/pgmspace.h>
 #include <util/delay_basic.h>
 
-
-#define digitalPinToPCICR(p) &PCICR //(((p) >= 0 && (p) <= 21) ? (&PCICR) : ((uint8_t *)0))
-#define digitalPinToPCICRbit(p) PCIE0 //(((p) <= 7) ? 2 : (((p) <= 13) ? 0 : 1))
-#define digitalPinToPCMSK(p)    &PCMSK0 //(((p) <= 7) ? (&PCMSK2) : (((p) <= 13) ? (&PCMSK0) : (((p) <= 21) ? (&PCMSK1) : ((uint8_t *)0))))
-#define digitalPinToPCMSKbit(p) PCINT0 //(((p) <= 7) ? (p) : (((p) <= 13) ? ((p) - 8) : ((p) - 14)))
-
-#define digitalPinToBitMask(pin) (1 << PB0)
-#define portOutputRegister(pin) &PORTB
-#define portInputRegister(pin) &PINB
-
-//#define digitalWrite(pin, val) val == HIGH ?
-//PORTB |= (1 << PB0); //HIGH
-//PORTB &= ~(1 << PB0); //LOW
-
 //PB0 , PCINT0
-#define pinMode_OUTPUT DDRB |= (1 << PB0)
-#define pinMode_INPUT DDRB &= ~(1 << PB0)
+#define RXPIN PB0
+#define RXPORT_IN PINB
+#define RXPORT_OUT PORTB
+
+#define PCICR_BIT PCIE0 //reg = PCICR
+#define PCMSK_REG PCMSK0
+#define PCMSK_BIT PCINT0
+
+#define TXPIN_HI RXPORT_OUT |= (1 << RXPIN)
+#define TXPIN_LO RXPORT_OUT &= ~(1 << RXPIN)
+
+#define pinMode_OUTPUT DDRB |= (1 << RXPIN)
+#define pinMode_INPUT DDRB &= ~(1 << RXPIN)
+
 
 /******************************************************************************
 * Definitions
@@ -70,14 +68,6 @@ template <uint8_t _SU_RX_BUFFER = 16>
 class SoftwareUart
 {
 private:
-	// per object data
-	//uint8_t _rxPin;
-	uint8_t _rxBitMask;
-	volatile uint8_t *_rxPort;
-
-	volatile uint8_t *_pcint_maskreg;
-	uint8_t _pcint_maskvalue;
-
 	// Expressed as 4-cycle delays (must never be 0!)
 	uint16_t _rx_delay_centering;
 	uint16_t _rx_delay_intrabit;
@@ -91,12 +81,8 @@ private:
 
 	// private methods
 	void recv();
-	uint8_t rx_pin_read() { return *_rxPort & _rxBitMask; }
+	uint8_t rx_pin_read() { return RXPORT_IN & (1 << RXPIN); }
 	void setRxIntMsk(bool enable);
-
-	//uint8_t _txPin;								//NS Added
-	uint8_t _txBitMask;
-	volatile uint8_t *_txPort;
 
 	uint16_t _tx_delay;
 
@@ -110,7 +96,7 @@ private:
 
 public:
 	// public methods
-	SoftwareUart(uint8_t receivePin);
+	SoftwareUart(void);
 	~SoftwareUart();
 	void begin(long speed);
 
@@ -157,7 +143,6 @@ void SoftwareUart<_SU_RX_BUFFER>::recv()
 		// Read each of the 8 bits
 		for (uint8_t i = 8; i > 0; --i)
 		{
-			PORTD ^= (1 << PD0);
 			tunedDelay(_rx_delay_intrabit);
 			d >>= 1;
 			if (rx_pin_read())
@@ -203,25 +188,9 @@ uint16_t SoftwareUart<_SU_RX_BUFFER>::subtract_cap(uint16_t num, uint16_t sub)
 // Constructor
 //
 template <uint8_t _SU_RX_BUFFER>
-SoftwareUart<_SU_RX_BUFFER>::SoftwareUart(uint8_t receivePin)
+SoftwareUart<_SU_RX_BUFFER>::SoftwareUart(void)
 {
 	_tx_delay = 0;
-	//_txPin = receivePin;
-	_txBitMask = digitalPinToBitMask(transmitPin);
-	_txPort = portOutputRegister(digitalPinToPort(transmitPin));
-	_pcint_maskvalue = 0;
-	_pcint_maskreg = NULL;
-
-	//?? pinMode_OUTPUT; //pinMode(_txPin, OUTPUT);
-
-	// First write, then set output. If we do this the other way around,
-	// the pin would be output low for a short while before switching to
-	// output high. Now, it is input with pullup for a short while, which
-	// is fine. With inverse logic, either order is fine.
-	//digitalWrite(_txPin, _inverse_logic ? LOW : HIGH);
-	//?? PORTB |= (1 << PB0); //HIGH
-
-	//?? pinMode_INPUT; //pinMode(_txPin, INPUT);
 
 	_buffer_overflow = false;
 
@@ -229,13 +198,9 @@ SoftwareUart<_SU_RX_BUFFER>::SoftwareUart(uint8_t receivePin)
 	_rx_delay_intrabit = 0;
 	_rx_delay_stopbit = 0;
 
-	//_rxPin = receivePin;
-	_rxBitMask = digitalPinToBitMask(receivePin);
-	_rxPort = portInputRegister(digitalPinToPort(receivePin));
-
 	pinMode_INPUT; //pinMode(_rxPin, INPUT);
 	//digitalWrite(_rxPin, HIGH);
-	PORTB |= (1 << PB0); //HIGH
+	TXPIN_HI; //HIGH
 	// pullup for normal logic
 }
 
@@ -294,11 +259,7 @@ void SoftwareUart<_SU_RX_BUFFER>::begin(long speed)
 	// Enable the PCINT for the entire port here, but never disable it
 	// (others might also need it, so we disable the interrupt by using
 	// the per-pin PCMSK register).
-	*digitalPinToPCICR(_rxPin) |= _BV(digitalPinToPCICRbit(_rxPin));
-	// Precalculate the pcint mask register and value, so setRxIntMask
-	// can be used inside the ISR without costing too much time.
-	_pcint_maskreg = digitalPinToPCMSK(_rxPin);
-	_pcint_maskvalue = _BV(digitalPinToPCMSKbit(_rxPin));
+	PCICR |= (1 << PCICR_BIT);
 
 	tunedDelay(_tx_delay); // if we were low this establishes the end
 	listen();
@@ -308,9 +269,9 @@ template <uint8_t _SU_RX_BUFFER>
 void SoftwareUart<_SU_RX_BUFFER>::setRxIntMsk(bool enable)
 {
 	if (enable)
-		*_pcint_maskreg |= _pcint_maskvalue;
+		PCMSK_REG |= (1 << PCMSK_BIT);
 	else
-		*_pcint_maskreg &= ~_pcint_maskvalue;
+		PCMSK_REG &= ~(1 << PCMSK_BIT);
 }
 
 // Read data from buffer
@@ -354,13 +315,6 @@ size_t SoftwareUart<_SU_RX_BUFFER>::write(uint8_t b)
 		return 0;
 	}
 
-	// By declaring these as local variables, the compiler will put them
-	// in registers _before_ disabling interrupts and entering the
-	// critical timing sections below, which makes it a lot easier to
-	// verify the cycle timings
-	volatile uint8_t *reg = _txPort;
-	uint8_t reg_mask = _txBitMask;
-	uint8_t inv_mask = ~_txBitMask;
 	uint8_t oldSREG = SREG;
 	uint16_t delay = _tx_delay;
 
@@ -370,7 +324,7 @@ size_t SoftwareUart<_SU_RX_BUFFER>::write(uint8_t b)
 	pinMode_OUTPUT; //pinMode(_txPin, OUTPUT);
 
 	// Write the start bit
-	*reg &= inv_mask;
+	TXPIN_LO;
 
 	tunedDelay(delay);
 
@@ -378,9 +332,9 @@ size_t SoftwareUart<_SU_RX_BUFFER>::write(uint8_t b)
 	for (uint8_t i = 8; i > 0; --i)
 	{
 		if (b & 1) // choose bit
-			*reg |= reg_mask; // send 1
+			RXPORT_OUT |= (1 << RXPIN); // send 1
 		else
-			*reg &= inv_mask; // send 0
+			RXPORT_OUT &= ~(1 << RXPIN); // send 0
 
 		tunedDelay(delay);
 		b >>= 1;
@@ -389,9 +343,10 @@ size_t SoftwareUart<_SU_RX_BUFFER>::write(uint8_t b)
 	// NS - Set Pin back to Input
 	pinMode_INPUT; //pinMode(_txPin, INPUT);
 
-	// restore pin to natural state
-	*reg |= reg_mask;
+	// restore pin to natural state (pullup ON)
+	TXPIN_HI;
 
+	PCIFR |= (1 << PCIF0);
 	SREG = oldSREG; // turn interrupts back on
 	tunedDelay(_tx_delay);
 

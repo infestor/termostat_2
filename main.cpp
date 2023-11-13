@@ -79,7 +79,7 @@ struct main_loop_prikazy_t {
 
 volatile main_loop_prikazy_t bitfield{};
 
-SoftwareUart<> uart(PB0);
+SoftwareUart<> uart;
 volatile uint8_t uart_buffer[8];
 volatile uint8_t uartPos; //pocet prijatych bytu na uartu
 volatile uint8_t uartExpected; //ocekavany pocet bajtu - je to hodnota prvniho byte pri zahajeni komunikace
@@ -246,6 +246,7 @@ void main(void)
 			}
 
 			bitfield.prekreslit_display = 1;
+			bitfield.prepocitat_topeni = 1;
 		}
 
 		// ---- NACITANI ONEWIRE DS18B20 teplot --------
