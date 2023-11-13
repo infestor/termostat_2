@@ -12,6 +12,7 @@
 #include "TM1637Display.h"
 #include "onewire.h"
 #include "ds18x20.h"
+#include "software_uart.h"
 
 //DEVICE definition
 #define DEV_ADDR 5 //1 is master, so it is not possible
@@ -69,10 +70,19 @@ struct main_loop_prikazy_t {
 	uint8_t mereni_teploty : 2; //STAVY_MERENI_TEPLOT, maximalni hodnota 3
 	uint8_t prekreslit_display : 1;
 	uint8_t display_ukazuje : 1; //SBERNICE_TEPLOTY (jen 1 nebo 0)
+	uint8_t uartInProgress : 1; //pokud jsme nekde uprostred prijimani celeho paketu
+	uint8_t uartTimeoutCitac : 2;
 
 	//inicializacni konstruktor nakonec neni potreba u definice staci dat {}
 	//main_loop_prikazy_t() : prepocitat_topeni(0), mereni_teploty(0), prekreslit_display(0), display_ukazuje(0) {};
 };
+
+volatile main_loop_prikazy_t bitfield{};
+
+SoftwareUart<> uart(PB0);
+volatile uint8_t uart_buffer[8];
+volatile uint8_t uartPos; //pocet prijatych bytu na uartu
+volatile uint8_t uartExpected; //ocekavany pocet bajtu - je to hodnota prvniho byte pri zahajeni komunikace
 
 void main() __attribute__ ((noreturn));
 
@@ -81,12 +91,18 @@ void main() __attribute__ ((noreturn));
 ISR(TIMER0_COMPA_vect) {
 	timer10msTriggered++;
 	longTimer++;
+
+	bitfield.uartTimeoutCitac++;
 }
 
 ISR(BADISR_vect) { //just for case
 	NOP
 }
 
+ISR(PCINT0_vect)
+{
+	uart.handle_interrupt();
+}
 //-----------------------------------------------------------
 void PrepniOwPodlaha(void)
 {
@@ -195,6 +211,9 @@ void init(void)
 	DDRD |= (1 << LED_OVERHEAT) | (1 << LED_TOPENI);
 	PORTD &= ~((1 << LED_OVERHEAT) | (1 << LED_TOPENI)); //obracena logika - 1 je vypne
 
+	//Software onewire UART na PB0
+	uart.begin(57600);
+
 }
 
 //-----------------------------------------------------------
@@ -207,7 +226,6 @@ void main(void)
 	memset((void*)&outPacket, 0, sizeof(mirfPacket) );
 
 	uint16_t tmout = longTimer + 200; //delay(2000)
-	volatile main_loop_prikazy_t prikazy{};
 
 	//Hlavni LOOP
 	for(;;)
@@ -218,36 +236,36 @@ void main(void)
 		{
 			static uint8_t x = 0;
 
-			tmout = longTimer + 500; //delay(5000)
+			tmout = longTimer + 100; //delay(5000)
 
 			x++;
-			if (x == 2)
+			if (x == 10)
 			{
-				prikazy.mereni_teploty = (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_PODLAHA; //prvni se dycky meri podlaha
+				bitfield.mereni_teploty = (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_PODLAHA; //prvni se dycky meri podlaha
 				x = 0;
 			}
 
-			prikazy.prekreslit_display = 1;
+			bitfield.prekreslit_display = 1;
 		}
 
 		// ---- NACITANI ONEWIRE DS18B20 teplot --------
-		if (prikazy.mereni_teploty > 0) // != (STAVY_MERENI_TEPLOT)NEMERI_SE
+		if (bitfield.mereni_teploty > 0) // != (STAVY_MERENI_TEPLOT)NEMERI_SE
 		{
-			if (prikazy.mereni_teploty == (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_PODLAHA)
+			if (bitfield.mereni_teploty == (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_PODLAHA)
 			{
 				PrepniOwPodlaha();
 				DS1820StartConversion();
-				prikazy.mereni_teploty = (STAVY_MERENI_TEPLOT)MERENI_PROBIHA;
+				bitfield.mereni_teploty = (STAVY_MERENI_TEPLOT)MERENI_PROBIHA;
 			}
 
-			if (prikazy.mereni_teploty == (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_VZDUCH)
+			if (bitfield.mereni_teploty == (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_VZDUCH)
 			{
 				PrepniOwVzduch();
 				DS1820StartConversion();
-				prikazy.mereni_teploty = (STAVY_MERENI_TEPLOT)MERENI_PROBIHA;
+				bitfield.mereni_teploty = (STAVY_MERENI_TEPLOT)MERENI_PROBIHA;
 			}
 
-			if (prikazy.mereni_teploty == (STAVY_MERENI_TEPLOT)MERENI_PROBIHA)
+			if (bitfield.mereni_teploty == (STAVY_MERENI_TEPLOT)MERENI_PROBIHA)
 			{
 
 				if (DS18X20_conversion_in_progress() == DS18X20_CONVERSION_DONE) //konverze je hotova
@@ -257,39 +275,41 @@ void main(void)
 
 					if (vybrana_sbernice_teplota == (SBERNICE_TEPLOTY)PODLAHA) //prvni se dycky meri podlaha
 					{
-						prikazy.mereni_teploty = (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_VZDUCH;
+						bitfield.mereni_teploty = (STAVY_MERENI_TEPLOT)ZAHAJIT_MERENI_VZDUCH;
 					}
 
 					if (vybrana_sbernice_teplota == (SBERNICE_TEPLOTY)VZDUCH)
 					{
-						prikazy.mereni_teploty = (STAVY_MERENI_TEPLOT)NEMERI_SE;
+						bitfield.mereni_teploty = (STAVY_MERENI_TEPLOT)NEMERI_SE;
+						bitfield.prepocitat_topeni = 1;
 					}
-
-					prikazy.prepocitat_topeni = 1;
-
 				}
 			}
 		}
 
 		// ---- DISPLAY --------------------------------
-		if (prikazy.prekreslit_display)
+		if (bitfield.prekreslit_display)
 		{
-			prikazy.prekreslit_display = 0;
+			bitfield.prekreslit_display = 0;
 
 			uint8_t znak_teploty;
 			volatile uint16_t *p_teplota;
+			uint16_t nast;
 
-			if (prikazy.display_ukazuje == (SBERNICE_TEPLOTY)PODLAHA) //prepneme na vzduch
+			if (bitfield.display_ukazuje == (SBERNICE_TEPLOTY)PODLAHA) //prepneme na vzduch
 			{
 				znak_teploty = ZNAK_VZDUCH;
-				prikazy.display_ukazuje = (SBERNICE_TEPLOTY)VZDUCH;
+				bitfield.display_ukazuje = (SBERNICE_TEPLOTY)VZDUCH;
 				p_teplota = &(teplota_vzduch.uint);
 			}
 			else //prepneme na podlahu
 			{
-				znak_teploty = ZNAK_PODLAHA;
-				prikazy.display_ukazuje = (SBERNICE_TEPLOTY)PODLAHA;
-				p_teplota = &(teplota_podlaha.uint);
+				//znak_teploty = ZNAK_PODLAHA;
+				bitfield.display_ukazuje = (SBERNICE_TEPLOTY)PODLAHA;
+				//p_teplota = &(teplota_podlaha.uint);
+				znak_teploty = ZNAK_SETPOINT;
+				nast = pozadovana_teplota;
+				p_teplota = &nast;
 			}
 
 			showNumber(*p_teplota);
@@ -297,9 +317,9 @@ void main(void)
 		}
 
 		//---- TOPENI ----------------------------------
-		if (prikazy.prepocitat_topeni)
+		if (bitfield.prepocitat_topeni)
 		{
-			prikazy.prepocitat_topeni = 0;
+			bitfield.prepocitat_topeni = 0;
 
 			if (((pozadavek_topeni != (STAVY_TOPENI)STAV_OFF) && (teplota_vzduch.uint < pozadovana_teplota)) ||
 				((pozadavek_topeni == (STAVY_TOPENI)STAV_OFF) && (teplota_vzduch.uint < (uint8_t)(pozadovana_teplota - HISTEREZE))))
@@ -326,10 +346,50 @@ void main(void)
 			}
 		}
 
+		//------------------------------------------------------------------------
+		if (uart.available())
+		{
+			//uart.write();
 
+			uint8_t inp = uart.read();
+
+			if (bitfield.uartInProgress == 0)
+			{
+				uartExpected = inp;
+				bitfield.uartInProgress = 1;
+				uartPos = 0;
+				bitfield.uartTimeoutCitac = 0;
+			}
+			else
+			{
+				if (uartPos == uartExpected) //incoming packet is longer than allowed
+				{
+					bitfield.uartInProgress = 0;
+				}
+				else
+				{
+					uart_buffer[uartPos] = inp;
+					uartPos++;
+				}
+			}
+		}
+
+		if ( (bitfield.uartInProgress) && (uartPos == uartExpected) ) //whole packet is received
+		{
+			//zpracujeme prichozi data
+			pozadovana_teplota = uart_buffer[0];
+		}
+
+		if ((bitfield.uartInProgress) && (bitfield.uartTimeoutCitac > 1) ) //timeout receiving whole packet
+		{
+			bitfield.uartInProgress = 0; //reset receiving
+		}
+
+		//------------------------------------------------------------------------
 		if (timer10msTriggered)
 		{
 			timer10msTriggered = 0;
+
 			Mirf.handleRxLoop();
 			Mirf.handleTxLoop();
 		}
